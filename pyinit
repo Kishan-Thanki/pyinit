@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+declare PYTHON_PATH
+declare PYTHON_VERSION
+declare PROJECT_NAME=""
+declare BASE_PATH="."
+declare DEPS=""
+declare SRC_LAYOUT="true"
+
+declare NAME_SET="false"
+declare PATH_SET="false"
+declare DEPS_SET="false"
+declare FLAT_SET="false"
+
+declare CREATED_DIR=""
+declare SUCCESS="false"
+
+cleanup_on_failure() {
+    local exit_code=$?
+
+    trap - EXIT INT TERM
+
+    if [ "$SUCCESS" = "false" ]; then
+        if [ -n "$CREATED_DIR" ] && [ -d "$CREATED_DIR" ]; then
+            echo "" >&2
+            echo "==================================================" >&2
+            echo "Error or interruption encountered! Rolling back..." >&2
+            echo "Removing partially created project directory: $CREATED_DIR" >&2
+            echo "==================================================" >&2
+            rm -rf "$CREATED_DIR"
+        fi
+    fi
+
+    exit "$exit_code"
+}
+
+trap cleanup_on_failure EXIT INT TERM
+
+usage(){
+    echo "Usage: pyinit [--name NAME] [--path PATH] [--deps \"dep1 dep2 ...\"] [--flat]"
+    echo ""
+    echo "  --name   Project folder to create (optional; if omitted, operates directly in --path)"
+    echo "  --path   Where to operate (optional; default: current directory; must already exist)"
+    echo "  --deps   Space-separated packages to install, in quotes (optional)"
+    echo "  --flat   Skip the src/ layout, scaffold flat instead (default: src/ layout is used)"
+}
+
+install_dependencies() {
+    if [ -n "$DEPS" ]; then
+        echo "Installing dependencies: $DEPS..."
+        venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1 || true
+
+        set +e
+        # shellcheck disable=SC2086
+        venv/bin/python -m pip install $DEPS
+        local pip_exit_code=$?
+        set -e
+
+        if [ "$pip_exit_code" -eq 0 ]; then
+            echo "Dependencies installed successfully."
+        else
+            echo "" >&2
+            echo "Warning: Failed to install one or more dependencies ($DEPS)." >&2
+            echo "Project structure and virtual environment remain intact." >&2
+            echo "You can manually install them later using: pip install $DEPS" >&2
+        fi
+    fi
+}
+
+sanitize_package_name() {
+    local raw="$1"
+    local sanitized
+
+    sanitized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]/_/g')"
+
+    case "$sanitized" in
+        [0-9]*) sanitized="_${sanitized}" ;;
+    esac
+
+    printf '%s' "$sanitized"
+}
+
+scaffold_project() {
+    local dir_name
+    dir_name="$(sanitize_package_name "$(basename "$PWD")")"
+
+    echo "Scaffolding layout ($( [ "$SRC_LAYOUT" = "true" ] && echo "src/" || echo "flat" ))..."
+
+    if [ "$SRC_LAYOUT" = "true" ]; then
+        mkdir -p "src/$dir_name"
+        touch "src/$dir_name/__init__.py"
+        cat <<EOF > "src/$dir_name/main.py"
+def main() -> None:
+    print("Hello from $dir_name!")
+
+if __name__ == "__main__":
+    main()
+EOF
+    else
+        mkdir -p "$dir_name"
+        touch "$dir_name/__init__.py"
+        cat <<EOF > "$dir_name/main.py"
+def main() -> None:
+    print("Hello from $dir_name!")
+
+if __name__ == "__main__":
+    main()
+EOF
+    fi
+
+    touch README.md
+    if [ ! -f .gitignore ]; then
+        cat <<EOF > .gitignore
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+EOF
+    fi
+}
+
+activate_virtual_environment() {
+    local activate_script="venv/bin/activate"
+
+    if [ ! -f "$activate_script" ]; then
+        echo "Error: Activation script not found at '$activate_script'." >&2
+        exit 1
+    fi
+
+    echo "Activating virtual environment..."
+    # shellcheck source=/dev/null
+    source "$activate_script"
+
+    if [ -z "${VIRTUAL_ENV:-}" ]; then
+        echo "Error: Failed to activate virtual environment." >&2
+        exit 1
+    fi
+
+    echo "Virtual environment activated successfully: $VIRTUAL_ENV"
+}
+
+create_virtual_environment(){
+    if [ -e "venv" ]; then
+        echo "Error: Virtual environment directory 'venv' already exists in '$(pwd)'." >&2
+        exit 1
+    fi
+
+    echo "Creating virtual environment..."
+    if "$PYTHON_PATH" -m venv venv; then
+        echo "Virtual environment created successfully."
+    else
+        echo "Error: failed to create virtual environment." >&2
+        exit 1
+    fi
+}
+
+prepare_directory(){
+    if [ -n "$PROJECT_NAME" ]; then
+        local target="$BASE_PATH/$PROJECT_NAME"
+        if [ -e "$target" ]; then
+            echo "Error: '$target' already exists." >&2
+            exit 1
+        fi
+        if ! mkdir "$target"; then
+            echo "Error: failed to create directory '$target'." >&2
+            exit 1
+        fi
+
+        CREATED_DIR="$(cd "$target" && pwd)"
+        cd "$target" || { echo "Error: failed to enter directory '$target'." >&2; exit 1; }
+        echo "Created project directory: $(pwd)"
+    else
+        cd "$BASE_PATH" || { echo "Error: failed to enter directory '$BASE_PATH'." >&2; exit 1; }
+        echo "Operating in: $(pwd)"
+    fi
+}
+
+check_python(){
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Error: python3 not found. Install it, or check that it's on your PATH." >&2
+        exit 1
+    fi
+
+    PYTHON_PATH="$(command -v python3)"
+    echo "Found python3 at: $PYTHON_PATH"
+
+    PYTHON_VERSION="$("$PYTHON_PATH" --version)"
+    echo "Version: $PYTHON_VERSION"
+}
+
+validate_path(){
+    if [ ! -d "$BASE_PATH" ]; then
+        echo "Error: path '$BASE_PATH' does not exist." >&2
+        exit 1
+    fi
+    if [ ! -w "$BASE_PATH" ]; then
+        echo "Error: path '$BASE_PATH' is not writable (permission denied)." >&2
+        exit 1
+    fi
+}
+
+validate_name(){
+    local name="$1"
+    if [ -z "$name" ]; then
+        echo "Error: --name cannot be empty." >&2
+        exit 1
+    fi
+    case "$name" in
+        */*)
+            echo "Error: --name cannot contain '/'. Use --path to choose a location instead." >&2
+            exit 1
+            ;;
+        .|..)
+            echo "Error: --name cannot be '.' or '..' ." >&2
+            exit 1
+            ;;
+    esac
+}
+
+check_args(){
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --name)
+                [ "$NAME_SET" = "true" ] && { echo "Error: --name specified more than once." >&2; exit 1; }
+                [ $# -ge 2 ] || { echo "Error: --name requires a value." >&2; exit 1; }
+                case "$2" in
+                    -*) echo "Error: --name requires a value, got flag-like '$2'." >&2; exit 1 ;;
+                esac
+                PROJECT_NAME="$2"
+                validate_name "$PROJECT_NAME"
+                NAME_SET="true"
+                shift 2
+                ;;
+            --path)
+                [ "$PATH_SET" = "true" ] && { echo "Error: --path specified more than once." >&2; exit 1; }
+                [ $# -ge 2 ] || { echo "Error: --path requires a value." >&2; exit 1; }
+                case "$2" in
+                    -*) echo "Error: --path requires a value, got flag-like '$2'." >&2; exit 1 ;;
+                esac
+                BASE_PATH="$2"
+                PATH_SET="true"
+                shift 2
+                ;;
+            --deps)
+                [ "$DEPS_SET" = "true" ] && { echo "Error: --deps specified more than once." >&2; exit 1; }
+                [ $# -ge 2 ] || { echo "Error: --deps requires a value." >&2; exit 1; }
+                case "$2" in
+                    -*) echo "Error: --deps requires a value, got flag-like '$2'." >&2; exit 1 ;;
+                esac
+                DEPS="$2"
+                DEPS_SET="true"
+                shift 2
+                ;;
+            --flat)
+                [ "$FLAT_SET" = "true" ] && { echo "Error: --flat specified more than once." >&2; exit 1; }
+                SRC_LAYOUT="false"
+                FLAT_SET="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Error: unknown argument '$1'" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+
+    validate_path
+}
+
+check_os() {
+    local os_type
+    os_type="$(uname -s)"
+    case "$os_type" in
+        Linux*|Darwin*)
+            ;;
+        *)
+            echo "Error: Unsupported operating system '$os_type'. This script only supports Linux and macOS." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main(){
+    echo "================ pyinit ================"
+    echo "pyinit: setting up your Python project..."
+
+    check_os
+    check_args "$@"
+    check_python
+    prepare_directory
+    create_virtual_environment
+    activate_virtual_environment
+    scaffold_project
+
+    SUCCESS="true"
+
+    install_dependencies
+
+    echo ""
+    echo "== Setup Complete =="
+    echo "Project location: $(pwd)"
+    echo "Layout: $( [ "$SRC_LAYOUT" = "true" ] && echo "src/" || echo "flat" )"
+    echo "Dependencies: ${DEPS:-<none>}"
+    echo "To activate in your current shell run: source venv/bin/activate"
+}
+
+main "$@"

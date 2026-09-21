@@ -1,0 +1,14 @@
+name: Linux
+
+"on":
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 --version
+      - run: chmod +x pyinit test_pyinit.sh
+      - run: ./test_pyinit.sh
